@@ -1,0 +1,53 @@
+# .gitlab-ci.yml - lint, syntax-check, and gated deploy of the LV-extension play.
+#
+# CI never logs into hosts to do destructive disk ops automatically. The deploy
+# job is `manual` and targets a single host you pass at trigger time, so growth
+# is always an intentional, audited action.
+#
+# CI/CD variables to set (Settings > CI/CD > Variables, masked):
+#   ANSIBLE_VAULT_PASSWORD   - if you encrypt inventory/secrets
+#   SSH_PRIVATE_KEY          - key for the deploy user on managed nodes
+# Pipeline variables to supply when running the manual deploy job:
+#   TARGET   (e.g. db01)      MODE (add|grow)        DEVICE (/dev/sdb)
+#   VG (vg_data)              LV (lv_data)           LV_SIZE (+100%FREE)
+
+stages: [validate, deploy]
+
+default:
+  image: quay.io/ansible/ansible-runner:latest
+  before_script:
+    - ansible --version
+    - ansible-galaxy collection install community.general
+
+yaml-lint:
+  stage: validate
+  before_script: [pip install --quiet yamllint ansible-lint]
+  script:
+    - yamllint extend-lv.yml
+    - ansible-lint extend-lv.yml
+
+syntax-check:
+  stage: validate
+  script:
+    - ansible-playbook extend-lv.yml --syntax-check
+
+extend-lv:
+  stage: deploy
+  when: manual                 # never runs unattended
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  before_script:
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+    - ansible-galaxy collection install community.general
+  script:
+    - |
+      ansible-playbook extend-lv.yml \
+        -i inventory.ini \
+        -l "${TARGET:?set TARGET}" \
+        -e "mode=${MODE:?}" \
+        -e "new_device=${DEVICE:?}" \
+        -e "vg_name=${VG:?}" \
+        -e "lv_name=${LV:?}" \
+        -e "lv_size=${LV_SIZE:-+100%FREE}" \
+        --diff

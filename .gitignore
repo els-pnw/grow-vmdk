@@ -1,0 +1,33 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Testing & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# uv
+.uv/
+
+# macOS
+.DS_Store
+
+# Ansible
+*.retry
+inventory.ini
+inventory/
+
+# Secrets / credentials — never commit these
+*.pem
+*.key
+id_rsa
+id_ed25519
+vault_pass*
+.vault_pass*
+
+.claude/

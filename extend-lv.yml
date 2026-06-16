@@ -1,0 +1,156 @@
+---
+# extend-lv.yml - Idempotent, guarded online extension of an LVM logical volume.
+#
+# RHEL 8.1+ / modern Debian-Ubuntu. LV + filesystem stay online.
+#
+# Safety pre-checks ("protect us from ourselves"):
+#   * add mode refuses to initialise a device that is mounted or already holds a
+#     filesystem (override with -e force=true).
+#   * asserts the VG and LV exist and the filesystem can be grown online.
+#   * detects whether the LV is mounted and only resizes the FS if it is.
+#   * backs up LVM metadata before any change.
+#   * lvol with +100%FREE is a safe no-op when there is nothing to grow.
+#
+# Requirements: collection community.general; nodes need lvm2, xfsprogs/e2fsprogs,
+# and (for partitioned grow) cloud-utils-growpart.
+
+- name: Online extension of an LVM logical volume (RHEL 8.1+)
+  hosts: "{{ target_hosts | default('lvm_targets') }}"
+  become: true
+
+  vars:
+    mode: add                 # add | grow
+    new_device: /dev/sdb      # add: new disk | grow: PV device (whole-disk PV assumed)
+    vg_name: vg_data
+    lv_name: lv_data
+    lv_size: "+100%FREE"
+    use_partition: false
+    rescan: true
+    force: false              # override device-in-use refusals (add mode)
+
+  tasks:
+    # ---- rescan --------------------------------------------------------------
+    - name: Rescan SCSI hosts so a newly presented disk is detected
+      ansible.builtin.shell: |
+        set -e
+        for h in /sys/class/scsi_host/host*/scan; do echo "- - -" > "$h"; done
+      changed_when: false
+      when: rescan | bool and mode == "add"
+
+    - name: Rescan the existing disk so its new size is detected
+      ansible.builtin.shell: "echo 1 > /sys/class/block/{{ new_device | basename }}/device/rescan"
+      changed_when: false
+      when: rescan | bool and mode == "grow"
+
+    - name: Wait for the block device to be present
+      ansible.builtin.wait_for:
+        path: "{{ new_device }}"
+        timeout: 30
+
+    - name: Resolve the PV device path
+      ansible.builtin.set_fact:
+        pv_device: >-
+          {{ (new_device ~ ('p1' if (new_device is search('[0-9]$')) else '1'))
+             if (mode == 'add' and use_partition | bool) else new_device }}
+
+    # ---- SAFETY: add-mode device-in-use guard --------------------------------
+    - name: SAFETY - is the device already a PV in the target VG (idempotent rerun)?
+      ansible.builtin.command: "pvs --noheadings -o vg_name {{ pv_device }}"
+      register: pv_vg
+      changed_when: false
+      failed_when: false
+
+    - name: SAFETY - count existing filesystems/mountpoints on the device
+      ansible.builtin.shell: |
+        set -o pipefail
+        lsblk -nro FSTYPE,MOUNTPOINT {{ new_device }} | awk 'NF' | wc -l
+      register: dev_inuse
+      changed_when: false
+      when: mode == "add" and (pv_vg.stdout | trim) != vg_name
+
+    - name: SAFETY - refuse to initialise a device that is in use
+      ansible.builtin.assert:
+        that: (dev_inuse.stdout | int) == 0
+        fail_msg: >-
+          {{ new_device }} already contains filesystems/mountpoints. Refusing to
+          overwrite. Set -e force=true only if you are certain this disk is empty.
+      when:
+        - mode == "add"
+        - (pv_vg.stdout | trim) != vg_name
+        - not (force | bool)
+
+    # ---- SAFETY: VG / LV / filesystem assertions -----------------------------
+    - name: SAFETY - confirm the volume group exists
+      ansible.builtin.command: "vgs {{ vg_name }}"
+      changed_when: false
+
+    - name: SAFETY - confirm the LV exists and capture its filesystem type
+      ansible.builtin.command: "lsblk -no FSTYPE /dev/{{ vg_name }}/{{ lv_name }}"
+      register: lv_fs
+      changed_when: false
+
+    - name: SAFETY - confirm the filesystem can be grown online
+      ansible.builtin.assert:
+        that: (lv_fs.stdout | trim) in ['xfs', 'ext2', 'ext3', 'ext4']
+        fail_msg: "Filesystem '{{ lv_fs.stdout | trim }}' on the LV is not supported for online auto-grow."
+
+    - name: SAFETY - is the LV mounted? (required for online XFS growth)
+      ansible.builtin.command: "findmnt -no TARGET /dev/{{ vg_name }}/{{ lv_name }}"
+      register: lv_mnt
+      changed_when: false
+      failed_when: false
+
+    - name: SAFETY - back up LVM metadata before any change
+      ansible.builtin.command: "vgcfgbackup {{ vg_name }}"
+      changed_when: false
+
+    # ---- ADD MODE: PV + VG ---------------------------------------------------
+    - name: Create a GPT partition spanning the new disk (LVM flag)
+      community.general.parted:
+        device: "{{ new_device }}"
+        number: 1
+        state: present
+        label: gpt
+        flags: [lvm]
+        part_start: 0%
+        part_end: 100%
+      when: mode == "add" and use_partition | bool and (pv_vg.stdout | trim) != vg_name
+
+    - name: Check whether the device is already a PV
+      ansible.builtin.command: "pvs --noheadings -o pv_name {{ pv_device }}"
+      register: pv_check
+      changed_when: false
+      failed_when: false
+      when: mode == "add"
+
+    - name: Initialise the physical volume
+      ansible.builtin.command: "pvcreate {{ pv_device }}"
+      when: mode == "add" and pv_check.rc != 0
+
+    - name: Extend the volume group with the new PV
+      ansible.builtin.command: "vgextend {{ vg_name }} {{ pv_device }}"
+      when: mode == "add" and (pv_vg.stdout | trim) != vg_name
+
+    # ---- GROW MODE: pvresize (whole-disk PV) ---------------------------------
+    - name: Resize the PV to consume the enlarged disk
+      ansible.builtin.command: "pvresize {{ pv_device }}"
+      register: pvresize_out
+      changed_when: "'successfully resized' in pvresize_out.stdout"
+      when: mode == "grow"
+
+    # ---- BOTH MODES: extend LV + grow filesystem online ----------------------
+    - name: Extend the logical volume and grow the filesystem online
+      community.general.lvol:
+        vg: "{{ vg_name }}"
+        lv: "{{ lv_name }}"
+        size: "{{ lv_size }}"
+        resizefs: "{{ (lv_mnt.stdout | trim) != '' }}"   # only grow FS if mounted
+
+    - name: Report the resulting filesystem size
+      ansible.builtin.command: "df -h /dev/{{ vg_name }}/{{ lv_name }}"
+      register: df_out
+      changed_when: false
+
+    - name: Show new geometry
+      ansible.builtin.debug:
+        msg: "{{ df_out.stdout_lines }}"
